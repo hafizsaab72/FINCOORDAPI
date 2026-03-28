@@ -1,6 +1,8 @@
 const router = require('express').Router();
 const FriendRequest = require('../models/FriendRequest');
+const User = require('../models/User');
 const requireAuth = require('../middleware/auth');
+const { sendPush } = require('../utils/push');
 
 router.use(requireAuth);
 
@@ -59,6 +61,16 @@ router.post('/request/:userId', async (req, res) => {
       receiver: req.params.userId,
     });
 
+    // Push to receiver
+    const receiver = await User.findById(req.params.userId).select('fcmToken');
+    if (receiver?.fcmToken) {
+      sendPush(receiver.fcmToken, {
+        title: 'New Friend Request',
+        body: `${req.user.name} wants to be your friend`,
+        data: { type: 'friend_request', requestId: request._id.toString() },
+      });
+    }
+
     res.status(201).json({ request });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -74,6 +86,17 @@ router.put('/accept/:requestId', async (req, res) => {
       { new: true },
     );
     if (!request) return res.status(404).json({ error: 'Request not found' });
+
+    // Push to original sender
+    const sender = await User.findById(request.sender).select('fcmToken');
+    if (sender?.fcmToken) {
+      sendPush(sender.fcmToken, {
+        title: 'Friend Request Accepted',
+        body: `${req.user.name} accepted your friend request`,
+        data: { type: 'friend_accepted' },
+      });
+    }
+
     res.json({ request });
   } catch (err) {
     res.status(500).json({ error: err.message });

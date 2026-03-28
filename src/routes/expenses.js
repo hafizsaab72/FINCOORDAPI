@@ -2,6 +2,7 @@ const router = require('express').Router();
 const Expense = require('../models/Expense');
 const Activity = require('../models/Activity');
 const requireAuth = require('../middleware/auth');
+const { scanReceipt } = require('../utils/ocr');
 
 // All routes require auth
 router.use(requireAuth);
@@ -52,6 +53,19 @@ router.delete('/:id', async (req, res) => {
     const expense = await Expense.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
     if (!expense) return res.status(404).json({ error: 'Expense not found' });
     res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/expenses/scan-receipt
+router.post('/scan-receipt', async (req, res) => {
+  try {
+    const { image } = req.body;
+    if (!image) return res.status(400).json({ error: 'image (base64) is required' });
+
+    const result = await scanReceipt(image);
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

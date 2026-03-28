@@ -62,4 +62,73 @@ router.get('/invite/:userId', async (req, res) => {
   }
 });
 
+// POST /api/users/match-contacts — match device contacts against registered users
+router.post('/match-contacts', requireAuth, async (req, res) => {
+  try {
+    const { phones = [], emails = [] } = req.body;
+    const userId = req.user._id;
+
+    // Normalize phone numbers to last 10 digits
+    const normalizedPhones = [...new Set(
+      phones
+        .map(p => p.replace(/\D/g, ''))
+        .filter(p => p.length >= 7)
+        .map(p => p.slice(-10)),
+    )];
+
+    const normalizedEmails = [...new Set(
+      emails.map(e => e.toLowerCase().trim()).filter(Boolean),
+    )];
+
+    if (normalizedPhones.length === 0 && normalizedEmails.length === 0) {
+      return res.json({ users: [] });
+    }
+
+    // Build exclusion set from existing relationships
+    const existing = await FriendRequest.find({
+      $or: [{ sender: userId }, { receiver: userId }],
+      status: { $ne: 'rejected' },
+    }).select('sender receiver');
+
+    const excludeIds = new Set([userId.toString()]);
+    existing.forEach(r => {
+      excludeIds.add(r.sender.toString());
+      excludeIds.add(r.receiver.toString());
+    });
+
+    // Build match clauses
+    const orClauses = [];
+    if (normalizedEmails.length > 0) {
+      orClauses.push({ email: { $in: normalizedEmails } });
+    }
+    // Match phones where stored value ends with the normalized 10-digit string
+    normalizedPhones.forEach(p => {
+      orClauses.push({ phone: { $regex: p + '$' } });
+    });
+
+    const users = await User.find({
+      _id: { $nin: [...excludeIds] },
+      $or: orClauses,
+    })
+      .select('name email profilePic phone')
+      .limit(100);
+
+    res.json({ users });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/users/device-token — register FCM token after login
+router.post('/device-token', requireAuth, async (req, res) => {
+  try {
+    const { token: fcmToken } = req.body;
+    if (!fcmToken) return res.status(400).json({ error: 'token required' });
+    await User.findByIdAndUpdate(req.user._id, { fcmToken });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
