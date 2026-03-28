@@ -12,6 +12,8 @@ REST API backend for the FinCoord financial coordination app. Built with Express
 | Framework | Express.js v4 |
 | Database | MongoDB Atlas (Mongoose v8) |
 | Auth | JWT (jsonwebtoken) + bcryptjs |
+| Firebase | firebase-admin (Phone Auth token verification + FCM push) |
+| OCR | tesseract.js (receipt scanning) |
 | Dev Server | nodemon |
 
 ---
@@ -21,26 +23,31 @@ REST API backend for the FinCoord financial coordination app. Built with Express
 ```
 /FinCoordAPI
 ├── server.js              # Entry point — DB connect + listen
+├── firebase-service-account.json   # ← NOT committed (add to get phone auth + push working)
 └── /src
-    ├── app.js             # Express app, route mounting, middleware
+    ├── app.js             # Express app, route mounting, CORS, middleware
     ├── /middleware
     │   └── auth.js        # JWT requireAuth middleware
     ├── /models
-    │   ├── User.js        # name, email, password, phone, bio, profilePic, currency
+    │   ├── User.js        # name, email, password, phone, bio, profilePic,
+    │   │                  #   currency, country, fcmToken, isPro
     │   ├── Expense.js     # amount, description, paidBy, group, splits
     │   ├── Bill.js        # title, amount, dueDate, category, recurrence
     │   ├── Group.js       # name, members[], createdBy
     │   ├── Activity.js    # type, description, user, ref
-    │   └── FriendRequest.js  # sender, receiver, status (pending/accepted/rejected)
-    └── /routes
-        ├── auth.js        # /api/auth — register, login, me, profile, account
-        ├── expenses.js    # /api/expenses — CRUD
-        ├── bills.js       # /api/bills — CRUD
-        ├── groups.js      # /api/groups — CRUD
-        ├── activities.js  # /api/activities — list
-        ├── data.js        # /api/data — bulk delete user data
-        ├── users.js       # /api/users — search, invite preview
-        └── friends.js     # /api/friends — friend requests CRUD
+    │   └── FriendRequest.js  # sender, receiver, status
+    ├── /routes
+    │   ├── auth.js        # /api/auth
+    │   ├── expenses.js    # /api/expenses (+ receipt OCR)
+    │   ├── bills.js       # /api/bills
+    │   ├── groups.js      # /api/groups
+    │   ├── activities.js  # /api/activities
+    │   ├── data.js        # /api/data (bulk delete)
+    │   ├── users.js       # /api/users (search, invite, device token)
+    │   └── friends.js     # /api/friends (requests + push notifications)
+    └── /utils
+        ├── push.js        # Firebase Admin SDK — sendPush() helper
+        └── ocr.js         # Tesseract.js OCR + regex parsers
 ```
 
 ---
@@ -59,25 +66,25 @@ MONGO_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/<dbname>?retryWr
 JWT_SECRET=your_jwt_secret_here
 JWT_EXPIRES_IN=7d
 ```
+> URL-encode special characters in the MongoDB password (e.g. `$` → `%24`).
 
-> Note: URL-encode special characters in the MongoDB password (e.g. `$` → `%24`).
+**3. Firebase service account (for Phone Auth verification + FCM push):**
+- Firebase Console → Project Settings → Service accounts → *Generate new private key*
+- Save as `firebase-service-account.json` in the project root (already in `.gitignore`)
 
-**3. Start the server:**
+**4. Start the server:**
 ```bash
-# Production
-npm start
-
-# Development (auto-restart)
-npm run dev
+npm run dev   # development (nodemon)
+npm start     # production
 ```
 
-Server listens on `0.0.0.0:3000` by default.
+Server listens on `0.0.0.0:3000`.
 
 ---
 
 ## API Reference
 
-All protected routes require the header:
+All protected routes require:
 ```
 Authorization: Bearer <token>
 ```
@@ -88,9 +95,12 @@ Authorization: Bearer <token>
 |---|---|---|---|
 | POST | `/register` | No | Create account. Body: `{ name, email, password }` |
 | POST | `/login` | No | Sign in. Body: `{ email, password }` |
+| POST | `/phone` | No | Phone OTP login. Body: `{ idToken, name?, country? }` — verifies Firebase ID token, finds or creates user by phone number |
 | GET | `/me` | Yes | Get current user profile |
-| PUT | `/profile` | Yes | Update profile. Body: `{ name?, phone?, bio?, currency?, profilePic? }` |
+| PUT | `/profile` | Yes | Update profile. Body: `{ name?, phone?, bio?, currency?, profilePic?, email?, newPassword? }` |
 | DELETE | `/account` | Yes | Delete account and all associated data |
+
+> `PUT /profile` accepts `email` + `newPassword` to let phone-only users add email/password login to their account.
 
 ### Expenses — `/api/expenses`
 
@@ -100,6 +110,7 @@ Authorization: Bearer <token>
 | POST | `/` | Yes | Create expense |
 | PUT | `/:id` | Yes | Update expense |
 | DELETE | `/:id` | Yes | Delete expense |
+| POST | `/scan-receipt` | Yes | OCR a receipt image. Body: `{ image: base64 }` → returns `{ amount, merchant, date, rawText }` |
 
 ### Bills — `/api/bills`
 
@@ -135,8 +146,9 @@ Authorization: Bearer <token>
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/search?q=` | Yes | Search users by name or email (excludes self + existing relationships) |
-| GET | `/invite/:userId` | No | Public — get user info for invite deep link landing page |
+| GET | `/search?q=` | Yes | Search users by name or email |
+| GET | `/invite/:userId` | No | Public — user info for invite deep link landing |
+| POST | `/device-token` | Yes | Store FCM token. Body: `{ fcmToken }` |
 
 ### Friends — `/api/friends`
 
@@ -144,19 +156,22 @@ Authorization: Bearer <token>
 |---|---|---|---|
 | GET | `/` | Yes | List accepted friends |
 | GET | `/requests` | Yes | List incoming pending requests |
-| POST | `/request/:userId` | Yes | Send a friend request |
-| PUT | `/accept/:requestId` | Yes | Accept a received request |
-| PUT | `/reject/:requestId` | Yes | Reject a received request |
+| POST | `/request/:userId` | Yes | Send a friend request (push notification sent to receiver) |
+| PUT | `/accept/:requestId` | Yes | Accept a request (push notification sent to original sender) |
+| PUT | `/reject/:requestId` | Yes | Reject a request |
 | DELETE | `/:friendId` | Yes | Remove friend or cancel sent request |
 
 ---
 
 ## Notes
 
-- **Profile photos** are stored as base64 data URLs directly in the User document. Images should be compressed to ≤400×400px at 70% quality before upload to stay well within MongoDB's 16MB BSON limit.
-- **Password hashing** is done via a Mongoose `pre('save')` hook using bcryptjs (10 rounds).
-- **Friend request deduplication** is enforced by a unique compound index on `{ sender, receiver }`.
+- **Phone Auth** — Firebase ID tokens are verified via `firebase-admin`. The `phone_number` field from the decoded token is used to find or create users. Phone numbers are stored in E.164 format (e.g. `+917760556716`).
+- **Phone-only accounts** — Given a placeholder email (`phone_<digits>@fincoord.internal`) and a random password. Users can add a real email/password later via `PUT /api/auth/profile`.
+- **Push notifications** — Sent via Firebase Admin SDK FCM. Requires `firebase-service-account.json`. Falls back silently if the token is missing or stale.
+- **Receipt OCR** — Tesseract.js processes images server-side; no external API key required. Regex parsers extract total amount, merchant name, and date from raw text.
+- **Profile photos** — Stored as base64 data URLs in the User document (≤400×400px, 70% quality to stay within MongoDB's 16 MB BSON limit).
+- **Password hashing** — Mongoose `pre('save')` hook via bcryptjs (10 rounds). Password changes must go through `.save()` to trigger the hook, not `findByIdAndUpdate`.
 
 ---
 
-**Version:** 1.0.0
+**Version:** 1.4.0
