@@ -3,11 +3,12 @@ const User = require('../models/User');
 const FriendRequest = require('../models/FriendRequest');
 const requireAuth = require('../middleware/auth');
 
-// GET /api/users/search?q=name_or_email
-// Returns users not already friends or pending, excludes self
+// GET /api/users/search?q=name_or_email&includeFriends=true
+// Returns users not already friends or pending, excludes self.
+// Pass includeFriends=true to also include accepted friends (e.g. group member search).
 router.get('/search', requireAuth, async (req, res) => {
   try {
-    const { q } = req.query;
+    const { q, includeFriends } = req.query;
     if (!q || q.trim().length < 2)
       return res.json({ users: [] });
 
@@ -19,7 +20,9 @@ router.get('/search', requireAuth, async (req, res) => {
       status: { $ne: 'rejected' },
     }).select('sender receiver status');
 
-    // Build exclusion set and relationship map
+    // Build exclusion set — always exclude self and pending/sent requests.
+    // When includeFriends=true, accepted friends are NOT excluded so they
+    // can be found for group-member searches.
     const excludeIds = new Set([userId.toString()]);
     const relationMap = {}; // userId → { status, requestId, direction }
     requests.forEach(r => {
@@ -27,7 +30,10 @@ router.get('/search', requireAuth, async (req, res) => {
         r.sender.toString() === userId.toString()
           ? r.receiver.toString()
           : r.sender.toString();
-      excludeIds.add(otherId);
+      const isAccepted = r.status === 'accepted';
+      if (!(includeFriends === 'true' && isAccepted)) {
+        excludeIds.add(otherId);
+      }
       relationMap[otherId] = {
         status: r.status,
         requestId: r._id,
@@ -40,6 +46,7 @@ router.get('/search', requireAuth, async (req, res) => {
       $or: [
         { name:  { $regex: q.trim(), $options: 'i' } },
         { email: { $regex: q.trim(), $options: 'i' } },
+        { phone: { $regex: q.trim().replace(/\D/g, '').slice(-10) } },
       ],
     })
       .select('name email profilePic')

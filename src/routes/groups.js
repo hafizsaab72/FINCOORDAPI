@@ -51,6 +51,69 @@ router.post('/', async (req, res) => {
   }
 });
 
+// PATCH /api/groups/:id — rename (any member can rename)
+router.patch('/:id', async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Name required' });
+    const group = await Group.findOneAndUpdate(
+      { _id: req.params.id, members: req.user._id },
+      { name: name.trim() },
+      { new: true },
+    )
+      .populate('members', 'name email profilePic')
+      .populate('createdBy', 'name email');
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    res.json({ group });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/groups/:id/members — add a member by userId
+router.post('/:id/members', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const group = await Group.findOneAndUpdate(
+      { _id: req.params.id, members: req.user._id },
+      { $addToSet: { members: userId } },
+      { new: true },
+    )
+      .populate('members', 'name email profilePic')
+      .populate('createdBy', 'name email');
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+
+    await Activity.create({
+      userId: req.user._id,
+      action: 'Added Member',
+      detail: group.name,
+    });
+
+    res.json({ group });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/groups/:id/members/:userId — remove a member (only creator)
+router.delete('/:id/members/:userId', async (req, res) => {
+  try {
+    const group = await Group.findOne({ _id: req.params.id, createdBy: req.user._id });
+    if (!group) return res.status(403).json({ error: 'Only the group creator can remove members' });
+    if (req.params.userId === group.createdBy.toString()) {
+      return res.status(400).json({ error: 'Cannot remove the group creator' });
+    }
+    group.members = group.members.filter(m => m.toString() !== req.params.userId);
+    await group.save();
+    await group.populate('members', 'name email profilePic');
+
+    res.json({ group });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // DELETE /api/groups/:id
 router.delete('/:id', async (req, res) => {
   try {

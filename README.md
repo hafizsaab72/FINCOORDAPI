@@ -61,7 +61,7 @@ npm install
 
 **2. Create `.env` in the project root:**
 ```env
-PORT=3000
+PORT=3050
 MONGO_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/<dbname>?retryWrites=true&w=majority
 JWT_SECRET=your_jwt_secret_here
 JWT_EXPIRES_IN=7d
@@ -78,7 +78,7 @@ npm run dev   # development (nodemon)
 npm start     # production
 ```
 
-Server listens on `0.0.0.0:3000`.
+Server listens on `0.0.0.0:3050`.
 
 ---
 
