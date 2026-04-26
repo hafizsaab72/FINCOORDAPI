@@ -1,6 +1,8 @@
 const router = require('express').Router();
 const FriendRequest = require('../models/FriendRequest');
 const User = require('../models/User');
+const Group = require('../models/Group');
+const Expense = require('../models/Expense');
 const requireAuth = require('../middleware/auth');
 const { sendPush } = require('../utils/push');
 
@@ -36,6 +38,99 @@ router.get('/requests', async (req, res) => {
     }).populate('sender', 'name email profilePic');
 
     res.json({ requests });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/friends/balances — per-friend balance breakdown by group
+router.get('/balances', async (req, res) => {
+  try {
+    const userId = req.user._id.toString();
+
+    // All groups user is a member of
+    const groups = await Group.find({ members: req.user._id }).select('_id name');
+    const groupIds = groups.map(g => g._id);
+    const groupMap = {};
+    groups.forEach(g => { groupMap[g._id.toString()] = g.name; });
+
+    // All expenses across those groups (regardless of who created them)
+    const expenses = await Expense.find({ groupId: { $in: groupIds } });
+
+    // balances[personId][groupId] = net (positive = they owe me, negative = I owe them)
+    const balances = {};
+
+    for (const exp of expenses) {
+      const payerId = exp.payerId.toString();
+      const gid = exp.groupId.toString();
+      const splits = exp.splitDetails instanceof Map
+        ? exp.splitDetails
+        : new Map(Object.entries(exp.splitDetails || {}));
+
+      if (splits.size === 0) continue;
+
+      if (payerId === userId) {
+        // I paid — others owe me their share
+        for (const [mid, share] of splits.entries()) {
+          if (mid === userId || Number(share) <= 0) continue;
+          if (!balances[mid]) balances[mid] = {};
+          balances[mid][gid] = (balances[mid][gid] || 0) + Number(share);
+        }
+      } else if (splits.has(userId)) {
+        // Someone else paid — I owe them my share
+        const myShare = Number(splits.get(userId));
+        if (myShare > 0) {
+          if (!balances[payerId]) balances[payerId] = {};
+          balances[payerId][gid] = (balances[payerId][gid] || 0) - myShare;
+        }
+      }
+    }
+
+    // Fetch user details for all involved people
+    const involvedIds = Object.keys(balances);
+    const users = await User.find({ _id: { $in: involvedIds } }).select('name email profilePic');
+    const userMap = {};
+    users.forEach(u => { userMap[u._id.toString()] = u; });
+
+    let totalOwedToYou = 0;
+    let totalYouOwe = 0;
+    const friends = [];
+
+    for (const [fid, groupBalances] of Object.entries(balances)) {
+      const netBalance = Object.values(groupBalances).reduce((a, b) => a + b, 0);
+      if (Math.abs(netBalance) < 0.01) continue;
+
+      if (netBalance > 0) totalOwedToYou += netBalance;
+      else totalYouOwe += Math.abs(netBalance);
+
+      const breakdown = Object.entries(groupBalances)
+        .filter(([, amt]) => Math.abs(amt) >= 0.01)
+        .map(([gid, amt]) => ({
+          groupId: gid,
+          groupName: groupMap[gid] || 'Unknown Group',
+          amount: parseFloat(Math.abs(amt).toFixed(2)),
+          direction: amt > 0 ? 'owes_you' : 'you_owe',
+        }))
+        .sort((a, b) => b.amount - a.amount);
+
+      const user = userMap[fid];
+      friends.push({
+        friendId: fid,
+        name: user?.name || 'Unknown',
+        email: user?.email || '',
+        profilePic: user?.profilePic,
+        netBalance: parseFloat(netBalance.toFixed(2)),
+        breakdown,
+      });
+    }
+
+    friends.sort((a, b) => Math.abs(b.netBalance) - Math.abs(a.netBalance));
+
+    res.json({
+      totalOwedToYou: parseFloat(totalOwedToYou.toFixed(2)),
+      totalYouOwe: parseFloat(totalYouOwe.toFixed(2)),
+      friends,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
