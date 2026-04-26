@@ -47,6 +47,22 @@ router.post('/', async (req, res) => {
   }
 });
 
+// PATCH /api/expenses/:id
+router.patch('/:id', async (req, res) => {
+  try {
+    const { amount, notes, currency, splitMethod, splitDetails } = req.body;
+    const expense = await Expense.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user._id },
+      { $set: { ...(amount != null && { amount }), ...(notes != null && { notes }), ...(currency && { currency }), ...(splitMethod && { splitMethod }), ...(splitDetails && { splitDetails }) } },
+      { new: true },
+    );
+    if (!expense) return res.status(404).json({ error: 'Expense not found' });
+    res.json({ expense });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // DELETE /api/expenses/:id
 router.delete('/:id', async (req, res) => {
   try {
