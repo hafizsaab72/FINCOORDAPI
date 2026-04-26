@@ -136,6 +136,37 @@ router.get('/balances', async (req, res) => {
   }
 });
 
+// GET /api/friends/requests/sent — outgoing pending requests
+router.get('/requests/sent', async (req, res) => {
+  try {
+    const requests = await FriendRequest.find({
+      sender: req.user._id,
+      status: 'pending',
+    }).populate('receiver', 'name email profilePic');
+    res.json({ requests });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/friends/:friendId/remind — send payment reminder push
+router.post('/:friendId/remind', async (req, res) => {
+  try {
+    const friend = await User.findById(req.params.friendId).select('fcmToken name');
+    if (!friend) return res.status(404).json({ error: 'User not found' });
+    if (friend.fcmToken) {
+      sendPush(friend.fcmToken, {
+        title: 'Payment Reminder',
+        body: `${req.user.name} is reminding you about a pending balance`,
+        data: { type: 'payment_reminder', fromUserId: req.user._id.toString() },
+      });
+    }
+    res.json({ sent: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/friends/request/:userId — send friend request
 router.post('/request/:userId', async (req, res) => {
   try {

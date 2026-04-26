@@ -148,7 +148,7 @@ router.get('/:id/balances', async (req, res) => {
   }
 });
 
-// GET /api/groups/:id/expenses — all expenses in group
+// GET /api/groups/:id/expenses — paginated expenses in group
 router.get('/:id/expenses', async (req, res) => {
   try {
     const myId = req.user._id.toString();
@@ -158,14 +158,88 @@ router.get('/:id/expenses', async (req, res) => {
       return res.status(403).json({ error: 'Not a member' });
     }
 
-    const expenses = await Expense.find({ groupId: req.params.id }).sort({ date: -1 });
+    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
+    const skip = parseInt(req.query.skip) || 0;
+
+    const [expenses, total] = await Promise.all([
+      Expense.find({ groupId: req.params.id }).sort({ date: -1 }).skip(skip).limit(limit),
+      Expense.countDocuments({ groupId: req.params.id }),
+    ]);
 
     const result = expenses.map(e => ({
       ...e.toObject(),
+      payerId: e.payerId.toString(),
       splitDetails: Object.fromEntries(e.splitDetails || new Map()),
     }));
 
-    res.json({ expenses: result });
+    res.json({ expenses: result, total, hasMore: skip + limit < total });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/groups/:id/leave — leave a group (non-creator only)
+router.post('/:id/leave', async (req, res) => {
+  try {
+    const myId = req.user._id.toString();
+    const group = await Group.findById(req.params.id);
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    if (!group.members.some(m => m.toString() === myId)) {
+      return res.status(403).json({ error: 'Not a member' });
+    }
+    if (group.createdBy.toString() === myId) {
+      return res.status(400).json({ error: 'Group creator cannot leave. Delete the group instead.' });
+    }
+    group.members = group.members.filter(m => m.toString() !== myId);
+    await group.save();
+    res.json({ message: 'Left group' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/groups/:id/settle — record a settlement payment
+router.post('/:id/settle', async (req, res) => {
+  try {
+    const { payerId, receiverId, amount, currency } = req.body;
+    if (!payerId || !receiverId || !amount) {
+      return res.status(400).json({ error: 'payerId, receiverId, and amount are required' });
+    }
+    const group = await Group.findById(req.params.id)
+      .populate('members', 'name');
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+
+    const memberIds = group.members.map(m => m._id.toString());
+    if (!memberIds.includes(payerId) || !memberIds.includes(receiverId)) {
+      return res.status(400).json({ error: 'Both users must be group members' });
+    }
+
+    const expense = await Expense.create({
+      userId: req.user._id,
+      groupId: group._id,
+      payerId,
+      amount: parseFloat(amount),
+      notes: 'Settlement',
+      splitMethod: 'custom',
+      splitDetails: { [receiverId]: parseFloat(amount) },
+      currency: currency || req.user.currency || 'USD',
+    });
+
+    const payerName = group.members.find(m => m._id.toString() === payerId)?.name ?? 'Someone';
+    const receiverName = group.members.find(m => m._id.toString() === receiverId)?.name ?? 'Someone';
+    await Activity.create({
+      userId: req.user._id,
+      action: 'Settled Up',
+      detail: `${payerName} paid ${receiverName} ${currency || ''}${parseFloat(amount).toFixed(2)}`,
+    });
+
+    res.status(201).json({
+      expense: {
+        ...expense.toObject(),
+        payerId: expense.payerId.toString(),
+        splitDetails: Object.fromEntries(expense.splitDetails || new Map()),
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
