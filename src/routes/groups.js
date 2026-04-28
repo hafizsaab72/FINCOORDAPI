@@ -49,6 +49,46 @@ function computeBalances(expenses, myId) {
   return balances;
 }
 
+/**
+ * Simplify debts using a min-heap / greedy algorithm.
+ * Given a map of net balances, returns the minimum set of transactions.
+ * Each transaction: { from, to, amount }
+ */
+function simplifyDebts(balances) {
+  const creditors = []; // people who are owed money (positive balance)
+  const debtors = [];   // people who owe money (negative balance)
+
+  for (const [userId, net] of Object.entries(balances)) {
+    if (net > 0.005) creditors.push({ userId, amount: net });
+    else if (net < -0.005) debtors.push({ userId, amount: -net });
+  }
+
+  creditors.sort((a, b) => b.amount - a.amount);
+  debtors.sort((a, b) => b.amount - a.amount);
+
+  const transactions = [];
+  let i = 0, j = 0;
+  while (i < debtors.length && j < creditors.length) {
+    const debtor = debtors[i];
+    const creditor = creditors[j];
+    const settleAmount = Math.min(debtor.amount, creditor.amount);
+
+    transactions.push({
+      from: debtor.userId,
+      to: creditor.userId,
+      amount: parseFloat(settleAmount.toFixed(2)),
+    });
+
+    debtor.amount -= settleAmount;
+    creditor.amount -= settleAmount;
+
+    if (debtor.amount < 0.01) i++;
+    if (creditor.amount < 0.01) j++;
+  }
+
+  return transactions;
+}
+
 // GET /api/groups — list all groups with per-group myBalance
 router.get('/', async (req, res) => {
   try {
@@ -142,7 +182,44 @@ router.get('/:id/balances', async (req, res) => {
       });
     }
 
-    res.json({ totalOwedToYou, totalYouOwe, memberBalances });
+    // Debt simplification
+    let simplifiedTransactions = null;
+    if (group.simplifyDebts) {
+      const fullBalances = {};
+      for (const member of group.members) {
+        const mid = member._id.toString();
+        fullBalances[mid] = 0;
+      }
+      for (const expense of expenses) {
+        const payerId = expense.payerId.toString();
+        const amount = expense.amount;
+        const splitMethod = expense.splitMethod;
+        const splitDetails = Object.fromEntries(expense.splitDetails || new Map());
+        const participants = Object.keys(splitDetails);
+        if (participants.length === 0) continue;
+
+        const getShare = (uid) => {
+          if (splitMethod === 'equal') return amount / participants.length;
+          if (splitMethod === 'percentage') return (amount * (splitDetails[uid] || 0)) / 100;
+          return splitDetails[uid] || 0;
+        };
+
+        fullBalances[payerId] = (fullBalances[payerId] || 0) + amount;
+        for (const uid of participants) {
+          fullBalances[uid] = (fullBalances[uid] || 0) - getShare(uid);
+        }
+      }
+      simplifiedTransactions = simplifyDebts(fullBalances);
+      // Resolve names
+      for (const tx of simplifiedTransactions) {
+        const fromMember = group.members.find(m => m._id.toString() === tx.from);
+        const toMember = group.members.find(m => m._id.toString() === tx.to);
+        tx.fromName = fromMember?.name ?? tx.from;
+        tx.toName = toMember?.name ?? tx.to;
+      }
+    }
+
+    res.json({ totalOwedToYou, totalYouOwe, memberBalances, simplifiedTransactions });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const ExpenseSchema = new mongoose.Schema(
   {
     userId:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    groupId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
+    groupId:      { type: mongoose.Schema.Types.Mixed, ref: 'Group', required: true }, // ObjectId or 'direct'
     payerId:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     amount:       { type: Number, required: true, min: 0 },
     notes:        { type: String, default: '' },

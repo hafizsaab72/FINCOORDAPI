@@ -10,6 +10,8 @@ const activityRoutes = require('./routes/activities');
 const dataRoutes    = require('./routes/data');
 const usersRoutes   = require('./routes/users');
 const friendsRoutes = require('./routes/friends');
+const currencyRoutes = require('./routes/currency');
+const exportRoutes   = require('./routes/export');
 
 const app = express();
 
@@ -25,6 +27,8 @@ app.use('/api/activities', activityRoutes);
 app.use('/api/data',    dataRoutes);
 app.use('/api/users',   usersRoutes);
 app.use('/api/friends', friendsRoutes);
+app.use('/api/currency', currencyRoutes);
+app.use('/api/export',   exportRoutes);
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
