@@ -64,10 +64,12 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+    console.log('[LOGIN DEBUG] Received email:', JSON.stringify(email));
     if (!email || !password)
       return res.status(400).json({ error: 'Email and password are required' });
 
     const user = await User.findOne({ email });
+    console.log('[LOGIN DEBUG] User found:', !!user);
     if (!user || !(await user.comparePassword(password)))
       return res.status(401).json({ error: 'Incorrect email or password' });
 
