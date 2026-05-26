@@ -1,6 +1,5 @@
 const router = require('express').Router();
 const Expense = require('../models/Expense');
-const Bill = require('../models/Bill');
 const requireAuth = require('../middleware/auth');
 
 router.use(requireAuth);
@@ -9,47 +8,35 @@ router.use(requireAuth);
 router.get('/', async (req, res) => {
   try {
     const format = req.query.format || 'json';
-    const expenses = await Expense.find({ userId: req.user._id }).sort({ date: -1 });
-    const bills = await Bill.find({ userId: req.user._id }).sort({ dueDate: -1 });
+    const expenses = await Expense.find({ createdBy: req.user._id }).sort({ expenseDate: -1 });
 
     const cleanExpenses = expenses.map(e => ({
       type: 'expense',
       id: e._id,
-      date: e.date,
-      description: e.notes,
-      amount: e.amount,
-      currency: e.currency,
+      date: e.expenseDate,
+      title: e.title,
+      description: e.description || e.notes,
+      amount: e.totalAmount != null ? (e.totalAmount / 100).toFixed(2) : null,
+      currency: e.baseCurrency,
       groupId: e.groupId?.toString(),
-      splitMethod: e.splitMethod,
+      splitMethod: e.splitType,
+      category: e.category,
     }));
-
-    const cleanBills = bills.map(b => ({
-      type: 'bill',
-      id: b._id,
-      date: b.dueDate,
-      description: b.title,
-      amount: b.amount,
-      currency: b.currency,
-      category: b.category,
-      status: b.status,
-    }));
-
-    const data = [...cleanExpenses, ...cleanBills];
 
     if (format === 'csv') {
       const rows = [
-        'Type,ID,Date,Description,Amount,Currency,Category,Status,GroupID,SplitMethod',
+        'Type,ID,Date,Title,Description,Amount,Currency,Category,GroupID,SplitMethod',
       ];
-      for (const item of data) {
+      for (const item of cleanExpenses) {
         rows.push([
           item.type,
           item.id,
           new Date(item.date).toISOString(),
+          `"${(item.title || '').replace(/"/g, '""')}"`,
           `"${(item.description || '').replace(/"/g, '""')}"`,
           item.amount,
           item.currency,
           item.category || '',
-          item.status || '',
           item.groupId || '',
           item.splitMethod || '',
         ].join(','));
@@ -59,7 +46,7 @@ router.get('/', async (req, res) => {
       res.setHeader('Content-Disposition', 'attachment; filename=fincoord_export.csv');
       res.send(csv);
     } else {
-      res.json({ data });
+      res.json({ data: cleanExpenses });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });

@@ -12,8 +12,10 @@ const UserSchema = new mongoose.Schema(
     profilePic:  { type: String, default: '' }, // filename served from /uploads
     currency:    { type: String, default: 'USD' },
     country:     { type: String, default: '' }, // ISO 3166-1 alpha-2, e.g. "GB"
-    fcmToken:    { type: String, default: '' },
-    isPro:       { type: Boolean, default: false },
+    fcmToken:             { type: String, default: '' },
+    isPro:                { type: Boolean, default: false },
+    resetPasswordToken:   { type: String, default: '' },
+    resetPasswordExpires: { type: Date },
   },
   { timestamps: true },
 );

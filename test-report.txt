@@ -1,0 +1,16 @@
+FinCoord Backend Test Report
+Generated: 2026-05-10T10:31:27.252Z
+
+PASS: Visibility
+PASS: Validation
+PASS: Multi-Payer
+PASS: Balances
+PASS: Dashboard
+PASS: Legacy Compat
+PASS: Group List
+PASS: Group Expenses Route
+PASS: Friends Balances Route
+PASS: Export Route
+PASS: Patch Expense Route
+
+Total: 11/11 passed

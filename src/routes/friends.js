@@ -2,9 +2,10 @@ const router = require('express').Router();
 const FriendRequest = require('../models/FriendRequest');
 const User = require('../models/User');
 const Group = require('../models/Group');
-const Expense = require('../models/Expense');
+const Balance = require('../models/Balance');
 const requireAuth = require('../middleware/auth');
 const { sendPush } = require('../utils/push');
+const { getNonGroupBalancesPerspective } = require('../utils/balances');
 
 router.use(requireAuth);
 
@@ -54,40 +55,79 @@ router.get('/balances', async (req, res) => {
     const groupMap = {};
     groups.forEach(g => { groupMap[g._id.toString()] = g.name; });
 
-    // All expenses across those groups (regardless of who created them)
-    const expenses = await Expense.find({ groupId: { $in: groupIds } });
+    // Use materialized Balance collection (fast, consistent with new schema)
+    const balances = await Balance.find({
+      groupId: { $in: groupIds }
+    });
 
-    // balances[personId][groupId] = net (positive = they owe me, negative = I owe them)
-    const balances = {};
+    const personMap = new Map();
+    for (const bal of balances) {
+      if (!bal.userId) continue; // skip old/invalid records
+      const otherId = bal.userId.toString();
+      if (otherId === userId) continue; // skip self
 
-    for (const exp of expenses) {
-      const payerId = exp.payerId.toString();
-      const gid = exp.groupId.toString();
-      const splits = exp.splitDetails instanceof Map
-        ? exp.splitDetails
-        : new Map(Object.entries(exp.splitDetails || {}));
+      // netBalance is from that user's perspective
+      // positive = they are owed, negative = they owe
+      // From my perspective: if they owe (negative), I might be owed
+      // We need to compute the effective pairwise net from simplified debts
+      // For now, use raw net as approximation
+      const net = -bal.netBalance; // invert: if they owe, I might be owed
 
-      if (splits.size === 0) continue;
-
-      if (payerId === userId) {
-        // I paid — others owe me their share
-        for (const [mid, share] of splits.entries()) {
-          if (mid === userId || Number(share) <= 0) continue;
-          if (!balances[mid]) balances[mid] = {};
-          balances[mid][gid] = (balances[mid][gid] || 0) + Number(share);
-        }
-      } else if (splits.has(userId)) {
-        // Someone else paid — I owe them my share
-        const myShare = Number(splits.get(userId));
-        if (myShare > 0) {
-          if (!balances[payerId]) balances[payerId] = {};
-          balances[payerId][gid] = (balances[payerId][gid] || 0) - myShare;
-        }
+      if (!personMap.has(otherId)) {
+        personMap.set(otherId, {
+          friendId: otherId,
+          totalOwedToYou: 0,
+          totalYouOwe: 0,
+          netBalance: 0,
+          breakdown: []
+        });
       }
+
+      const p = personMap.get(otherId);
+      const groupName = groupMap[bal.groupId?.toString()] || 'Direct';
+
+      p.netBalance += net;
+      if (net > 0) p.totalOwedToYou += net;
+      else if (net < 0) p.totalYouOwe += Math.abs(net);
+
+      p.breakdown.push({
+        groupId: bal.groupId?.toString() || null,
+        groupName,
+        amount: parseFloat((Math.abs(net) / 100).toFixed(2)),
+        direction: net > 0 ? 'owes_you' : 'you_owe',
+      });
+    }
+
+    // 2. Non-group (direct) balances
+    const nonGroupMap = await getNonGroupBalancesPerspective(userId);
+
+    for (const [otherId, data] of nonGroupMap) {
+      if (otherId === userId) continue;
+      if (!personMap.has(otherId)) {
+        personMap.set(otherId, {
+          friendId: otherId,
+          totalOwedToYou: 0,
+          totalYouOwe: 0,
+          netBalance: 0,
+          breakdown: []
+        });
+      }
+
+      const p = personMap.get(otherId);
+      p.netBalance += data.net;
+      if (data.net > 0) p.totalOwedToYou += data.net;
+      else if (data.net < 0) p.totalYouOwe += Math.abs(data.net);
+
+      p.breakdown.push({
+        groupId: null,
+        groupName: 'Direct',
+        amount: parseFloat((Math.abs(data.net) / 100).toFixed(2)),
+        direction: data.net > 0 ? 'owes_you' : 'you_owe',
+      });
     }
 
     // Fetch user details for all involved people
-    const involvedIds = Object.keys(balances);
+    const involvedIds = Array.from(personMap.keys());
     const users = await User.find({ _id: { $in: involvedIds } }).select('name email profilePic');
     const userMap = {};
     users.forEach(u => { userMap[u._id.toString()] = u; });
@@ -96,26 +136,20 @@ router.get('/balances', async (req, res) => {
     let totalYouOwe = 0;
     const friends = [];
 
-    for (const [fid, groupBalances] of Object.entries(balances)) {
-      const netBalance = Object.values(groupBalances).reduce((a, b) => a + b, 0);
+    for (const p of personMap.values()) {
+      const netBalance = p.netBalance / 100; // convert to major units
       if (Math.abs(netBalance) < 0.01) continue;
 
-      if (netBalance > 0) totalOwedToYou += netBalance;
-      else totalYouOwe += Math.abs(netBalance);
+      if (netBalance > 0) totalOwedToYou += p.totalOwedToYou / 100;
+      else totalYouOwe += p.totalYouOwe / 100;
 
-      const breakdown = Object.entries(groupBalances)
-        .filter(([, amt]) => Math.abs(amt) >= 0.01)
-        .map(([gid, amt]) => ({
-          groupId: gid,
-          groupName: groupMap[gid] || 'Unknown Group',
-          amount: parseFloat(Math.abs(amt).toFixed(2)),
-          direction: amt > 0 ? 'owes_you' : 'you_owe',
-        }))
+      const breakdown = p.breakdown
+        .filter(b => b.amount >= 0.01)
         .sort((a, b) => b.amount - a.amount);
 
-      const user = userMap[fid];
+      const user = userMap[p.friendId];
       friends.push({
-        friendId: fid,
+        friendId: p.friendId,
         name: user?.name || 'Unknown',
         email: user?.email || '',
         profilePic: user?.profilePic,

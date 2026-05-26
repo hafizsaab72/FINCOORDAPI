@@ -1,93 +1,19 @@
 const router = require('express').Router();
 const Group = require('../models/Group');
 const Expense = require('../models/Expense');
+const User = require('../models/User');
 const Activity = require('../models/Activity');
+const Balance = require('../models/Balance');
 const requireAuth = require('../middleware/auth');
+const {
+  updateBalancesOnExpenseCreate,
+  getGroupBalances,
+  simplifyDebts: simplifyDebtsUtil,
+  recalculateGroupBalances
+} = require('../utils/balances');
+const { toMinorUnits } = require('../utils/validation');
 
 router.use(requireAuth);
-
-/**
- * Compute per-person net balances from current user's POV.
- * Returns Record<userId, net> — positive = they owe me, negative = I owe them.
- */
-function computeBalances(expenses, myId) {
-  const balances = {};
-
-  for (const expense of expenses) {
-    const payerId = expense.payerId.toString();
-    const amount = expense.amount;
-    const splitMethod = expense.splitMethod;
-    const splitDetails = Object.fromEntries(expense.splitDetails || new Map());
-    const participants = Object.keys(splitDetails);
-
-    if (participants.length === 0) continue;
-
-    const getShare = (userId) => {
-      if (splitMethod === 'equal') return amount / participants.length;
-      if (splitMethod === 'percentage') return (amount * (splitDetails[userId] || 0)) / 100;
-      return splitDetails[userId] || 0;
-    };
-
-    if (payerId === myId) {
-      // I paid — each other participant owes me their share
-      for (const userId of participants) {
-        if (userId === myId) continue;
-        const share = getShare(userId);
-        if (share > 0.001) {
-          balances[userId] = (balances[userId] || 0) + share;
-        }
-      }
-    } else if (participants.includes(myId)) {
-      // Someone else paid and I have a share — I owe the payer
-      const myShare = getShare(myId);
-      if (myShare > 0.001) {
-        balances[payerId] = (balances[payerId] || 0) - myShare;
-      }
-    }
-  }
-
-  return balances;
-}
-
-/**
- * Simplify debts using a min-heap / greedy algorithm.
- * Given a map of net balances, returns the minimum set of transactions.
- * Each transaction: { from, to, amount }
- */
-function simplifyDebts(balances) {
-  const creditors = []; // people who are owed money (positive balance)
-  const debtors = [];   // people who owe money (negative balance)
-
-  for (const [userId, net] of Object.entries(balances)) {
-    if (net > 0.005) creditors.push({ userId, amount: net });
-    else if (net < -0.005) debtors.push({ userId, amount: -net });
-  }
-
-  creditors.sort((a, b) => b.amount - a.amount);
-  debtors.sort((a, b) => b.amount - a.amount);
-
-  const transactions = [];
-  let i = 0, j = 0;
-  while (i < debtors.length && j < creditors.length) {
-    const debtor = debtors[i];
-    const creditor = creditors[j];
-    const settleAmount = Math.min(debtor.amount, creditor.amount);
-
-    transactions.push({
-      from: debtor.userId,
-      to: creditor.userId,
-      amount: parseFloat(settleAmount.toFixed(2)),
-    });
-
-    debtor.amount -= settleAmount;
-    creditor.amount -= settleAmount;
-
-    if (debtor.amount < 0.01) i++;
-    if (creditor.amount < 0.01) j++;
-  }
-
-  return transactions;
-}
 
 // GET /api/groups — list all groups with per-group myBalance
 router.get('/', async (req, res) => {
@@ -98,37 +24,51 @@ router.get('/', async (req, res) => {
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 });
 
-    const groupIds = groups.map(g => g._id);
-    const allExpenses = await Expense.find({ groupId: { $in: groupIds } });
+    const groupIds = groups.map(g => g._id.toString());
 
-    // Index expenses by groupId
-    const expensesByGroup = {};
-    for (const expense of allExpenses) {
-      const gid = expense.groupId.toString();
-      if (!expensesByGroup[gid]) expensesByGroup[gid] = [];
-      expensesByGroup[gid].push(expense);
+    // Use materialized per-user net balances for fast per-group summary
+    const balances = await Balance.find({ groupId: { $in: groupIds } });
+
+    // Index balances by groupId
+    const balancesByGroup = {};
+    for (const bal of balances) {
+      if (!bal.userId) continue;
+      const gid = bal.groupId.toString();
+      if (!balancesByGroup[gid]) balancesByGroup[gid] = { users: new Map() };
+      balancesByGroup[gid].users.set(bal.userId.toString(), bal.netBalance);
     }
 
     const result = groups.map(group => {
       const gid = group._id.toString();
-      const expenses = expensesByGroup[gid] || [];
-      const balances = computeBalances(expenses, myId);
+      const groupBals = balancesByGroup[gid]?.users || new Map();
 
+      // Build balance map for simplified debt computation
+      const balanceMap = new Map();
+      for (const member of group.members) {
+        balanceMap.set(member._id.toString(), groupBals.get(member._id.toString()) || 0);
+      }
+      balanceMap.set(myId, groupBals.get(myId) || 0);
+
+      // Compute simplified debts to find this user's position
+      const simplified = simplifyDebtsUtil(balanceMap);
       let totalOwedToYou = 0;
       let totalYouOwe = 0;
       const topDebts = [];
 
-      for (const [userId, net] of Object.entries(balances)) {
-        if (net > 0.005) {
-          totalOwedToYou += net;
-          const member = group.members.find(m => m._id.toString() === userId);
-          topDebts.push({ userId, name: member?.name ?? 'Unknown', net });
-        } else if (net < -0.005) {
-          totalYouOwe += Math.abs(net);
+      for (const tx of simplified) {
+        if (tx.to === myId) {
+          totalOwedToYou += tx.amount;
+          const member = group.members.find(m => m._id.toString() === tx.from);
+          topDebts.push({ userId: tx.from, name: member?.name ?? 'Unknown', net: tx.amount });
+        }
+        if (tx.from === myId) {
+          totalYouOwe += tx.amount;
+          const member = group.members.find(m => m._id.toString() === tx.to);
+          topDebts.push({ userId: tx.to, name: member?.name ?? 'Unknown', net: -tx.amount });
         }
       }
 
-      topDebts.sort((a, b) => b.net - a.net);
+      topDebts.sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
 
       const obj = group.toObject();
       obj.myBalance = {
@@ -157,69 +97,90 @@ router.get('/:id/balances', async (req, res) => {
       return res.status(403).json({ error: 'Not a member' });
     }
 
-    const expenses = await Expense.find({ groupId: group._id });
-    const balances = computeBalances(expenses, myId);
+    const balanceData = await getGroupBalances(req.params.id, myId);
 
-    let totalOwedToYou = 0;
-    let totalYouOwe = 0;
-    const memberBalances = [];
-
+    // Build a set of all userIds that appear in balance records,
+    // so removed members with non-zero balances are still visible.
+    const balanceUserIds = new Set(
+      balanceData.userBalances.map(b => b.otherUserId.toString())
+    );
     for (const member of group.members) {
-      const memberId = member._id.toString();
-      if (memberId === myId) {
+      balanceUserIds.add(member._id.toString());
+    }
+    balanceUserIds.add(myId);
+
+    // Look up names for any user not in the current member list
+    // (e.g. a removed member whose balance hasn't been zeroed yet)
+    const missingUserIds = [];
+    for (const uid of balanceUserIds) {
+      const found = group.members.find(m => m._id.toString() === uid);
+      if (!found && uid !== myId) missingUserIds.push(uid);
+    }
+    const missingUsers = missingUserIds.length > 0
+      ? await User.find({ _id: { $in: missingUserIds } }).select('name email profilePic')
+      : [];
+    const missingUserMap = new Map(missingUsers.map(u => [u._id.toString(), u]));
+
+    const memberBalances = [];
+    for (const uid of balanceUserIds) {
+      if (uid === myId) {
+        const me = group.members.find(m => m._id.toString() === myId);
         memberBalances.push({
-          memberId, name: member.name, email: member.email,
-          profilePic: member.profilePic, isMe: true, net: 0,
+          memberId: myId,
+          name: me?.name ?? 'You',
+          email: me?.email ?? '',
+          profilePic: me?.profilePic,
+          isMe: true,
+          net: 0,
+          isFormerMember: !group.members.some(m => m._id.toString() === myId),
         });
         continue;
       }
-      const net = balances[memberId] || 0;
-      if (net > 0.005) totalOwedToYou += net;
-      else if (net < -0.005) totalYouOwe += Math.abs(net);
+
+      const member = group.members.find(m => m._id.toString() === uid);
+      const missing = missingUserMap.get(uid);
+      const found = balanceData.userBalances.find(b => b.otherUserId.toString() === uid);
+      const net = found ? found.netBalance : 0;
+
+      // Skip former members who have been fully zeroed out after recalculation
+      if (!member && !missing && Math.abs(net) < 0.005) continue;
+
       memberBalances.push({
-        memberId, name: member.name, email: member.email,
-        profilePic: member.profilePic, isMe: false, net,
+        memberId: uid,
+        name: member?.name ?? missing?.name ?? 'Unknown',
+        email: member?.email ?? missing?.email ?? '',
+        profilePic: member?.profilePic ?? missing?.profilePic,
+        isMe: false,
+        net,
+        isFormerMember: !member,
       });
     }
 
-    // Debt simplification
     let simplifiedTransactions = null;
     if (group.simplifyDebts) {
-      const fullBalances = {};
-      for (const member of group.members) {
-        const mid = member._id.toString();
-        fullBalances[mid] = 0;
+      const balanceMap = new Map();
+      for (const mb of memberBalances) {
+        balanceMap.set(mb.memberId, mb.net);
       }
-      for (const expense of expenses) {
-        const payerId = expense.payerId.toString();
-        const amount = expense.amount;
-        const splitMethod = expense.splitMethod;
-        const splitDetails = Object.fromEntries(expense.splitDetails || new Map());
-        const participants = Object.keys(splitDetails);
-        if (participants.length === 0) continue;
+      // Ensure the current user is in the map even if they have no balance record
+      const myBal = await Balance.findOne({ groupId: req.params.id, userId: req.user._id });
+      balanceMap.set(myId, myBal ? myBal.netBalance : 0);
 
-        const getShare = (uid) => {
-          if (splitMethod === 'equal') return amount / participants.length;
-          if (splitMethod === 'percentage') return (amount * (splitDetails[uid] || 0)) / 100;
-          return splitDetails[uid] || 0;
-        };
-
-        fullBalances[payerId] = (fullBalances[payerId] || 0) + amount;
-        for (const uid of participants) {
-          fullBalances[uid] = (fullBalances[uid] || 0) - getShare(uid);
-        }
-      }
-      simplifiedTransactions = simplifyDebts(fullBalances);
-      // Resolve names
+      simplifiedTransactions = simplifyDebtsUtil(balanceMap);
       for (const tx of simplifiedTransactions) {
-        const fromMember = group.members.find(m => m._id.toString() === tx.from);
-        const toMember = group.members.find(m => m._id.toString() === tx.to);
-        tx.fromName = fromMember?.name ?? tx.from;
-        tx.toName = toMember?.name ?? tx.to;
+        const fromMb = memberBalances.find(m => m.memberId === tx.from);
+        const toMb = memberBalances.find(m => m.memberId === tx.to);
+        tx.fromName = fromMb?.name ?? tx.from;
+        tx.toName = toMb?.name ?? tx.to;
       }
     }
 
-    res.json({ totalOwedToYou, totalYouOwe, memberBalances, simplifiedTransactions });
+    res.json({
+      totalOwedToYou: balanceData.totalOwedToYou,
+      totalYouOwe: balanceData.totalYouOwe,
+      memberBalances,
+      simplifiedTransactions
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -239,17 +200,14 @@ router.get('/:id/expenses', async (req, res) => {
     const skip = parseInt(req.query.skip) || 0;
 
     const [expenses, total] = await Promise.all([
-      Expense.find({ groupId: req.params.id }).sort({ date: -1 }).skip(skip).limit(limit),
-      Expense.countDocuments({ groupId: req.params.id }),
+      Expense.find({ groupId: req.params.id, isDeleted: { $ne: true } })
+        .sort({ expenseDate: -1 })
+        .skip(skip)
+        .limit(limit),
+      Expense.countDocuments({ groupId: req.params.id, isDeleted: { $ne: true } }),
     ]);
 
-    const result = expenses.map(e => ({
-      ...e.toObject(),
-      payerId: e.payerId.toString(),
-      splitDetails: Object.fromEntries(e.splitDetails || new Map()),
-    }));
-
-    res.json({ expenses: result, total, hasMore: skip + limit < total });
+    res.json({ expenses, total, hasMore: skip + limit < total });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -278,45 +236,107 @@ router.post('/:id/leave', async (req, res) => {
 // POST /api/groups/:id/settle — record a settlement payment
 router.post('/:id/settle', async (req, res) => {
   try {
-    const { payerId, receiverId, amount, currency } = req.body;
-    if (!payerId || !receiverId || !amount) {
-      return res.status(400).json({ error: 'payerId, receiverId, and amount are required' });
-    }
-    const group = await Group.findById(req.params.id)
+    const { withMemberId, amount, paymentMethod, note } = req.body;
+    const groupId = req.params.id;
+    const myId = req.user._id.toString();
+
+    // Verify group membership
+    const group = await Group.findById(groupId)
       .populate('members', 'name');
     if (!group) return res.status(404).json({ error: 'Group not found' });
-
-    const memberIds = group.members.map(m => m._id.toString());
-    if (!memberIds.includes(payerId) || !memberIds.includes(receiverId)) {
-      return res.status(400).json({ error: 'Both users must be group members' });
+    if (!group.members.some(m => m._id.toString() === myId)) {
+      return res.status(403).json({ error: 'Not a member' });
     }
 
-    const expense = await Expense.create({
+    // Use getGroupBalances to compute simplified debts
+    const groupData = await getGroupBalances(groupId, req.user._id);
+
+    // Find the simplified transaction between me and the other member
+    const myTx = groupData.simplifiedTransactions.find(
+      tx => (tx.from === myId && tx.to === withMemberId) || (tx.to === myId && tx.from === withMemberId)
+    );
+
+    if (!myTx) {
+      return res.status(400).json({ error: 'No balance found with this member' });
+    }
+
+    // Determine who owes whom and how much
+    const iOwe = myTx.from === myId ? myTx.amount : -myTx.amount;
+    if (iOwe >= 0) {
+      return res.status(400).json({
+        error: 'You are not in debt with this member',
+        currentBalance: -iOwe
+      });
+    }
+
+    const maxSettlement = Math.min(
+      amount ? Math.round(parseFloat(amount) * 100) : Math.abs(iOwe),
+      Math.abs(iOwe)
+    );
+
+    if (maxSettlement <= 0) {
+      return res.status(400).json({ error: 'Nothing to settle' });
+    }
+
+    // Create a settlement expense record (for audit trail)
+    const settlementExpense = await Expense.create({
+      title: note || `Settlement`,
+      description: note || `Settlement with ${withMemberId}`,
+      totalAmount: maxSettlement,
+      baseCurrency: req.user.currency || 'INR',
+      contextType: 'group',
+      groupId,
+      isSettlement: true,
+      settlementFrom: myId,
+      settlementTo: withMemberId,
+      payments: [{ userId: myId, amount: maxSettlement }],
+      splits: [{ userId: withMemberId, owedAmount: maxSettlement, shareType: 'exact' }],
+      splitType: 'exact',
+      createdBy: req.user._id,
       userId: req.user._id,
-      groupId: group._id,
-      payerId,
-      amount: parseFloat(amount),
-      notes: 'Settlement',
-      splitMethod: 'custom',
-      splitDetails: { [receiverId]: parseFloat(amount) },
-      currency: currency || req.user.currency || 'USD',
+      category: 'settlement'
     });
 
-    const payerName = group.members.find(m => m._id.toString() === payerId)?.name ?? 'Someone';
-    const receiverName = group.members.find(m => m._id.toString() === receiverId)?.name ?? 'Someone';
+    // Update balances (uses the same logic as regular expense creation)
+    await updateBalancesOnExpenseCreate(settlementExpense, null);
+
+    // Log activity
+    const payerName = group.members.find(m => m._id.toString() === myId)?.name ?? 'Someone';
+    const receiverName = group.members.find(m => m._id.toString() === withMemberId)?.name ?? 'Someone';
     await Activity.create({
       userId: req.user._id,
       action: 'Settled Up',
-      detail: `${payerName} paid ${receiverName} ${currency || ''}${parseFloat(amount).toFixed(2)}`,
+      detail: `${payerName} settled ${(maxSettlement / 100).toFixed(2)} with ${receiverName}`,
+      expenseId: settlementExpense._id,
+      groupId,
+      metadata: {
+        withMemberId,
+        amount: maxSettlement,
+        paymentMethod
+      }
     });
 
-    res.status(201).json({
-      expense: {
-        ...expense.toObject(),
-        payerId: expense.payerId.toString(),
-        splitDetails: Object.fromEntries(expense.splitDetails || new Map()),
-      },
+    res.json({
+      settled: maxSettlement,
+      settlementExpenseId: settlementExpense._id,
+      message: `Successfully settled ${(maxSettlement / 100).toFixed(2)}`
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/groups/:id/recalculate-balances
+router.post('/:id/recalculate-balances', async (req, res) => {
+  try {
+    const group = await Group.findById(req.params.id);
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    if (!group.members.some(m => m.toString() === req.user._id.toString())) {
+      return res.status(403).json({ error: 'Not a member' });
+    }
+
+    const result = await recalculateGroupBalances(req.params.id);
+    res.json({ message: 'Balances recalculated', ...result });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -341,9 +361,19 @@ router.get('/:id', async (req, res) => {
 // POST /api/groups
 router.post('/', async (req, res) => {
   try {
-    const { name, memberIds } = req.body;
+    const { name, memberIds, type, icon, image, startDate, endDate, simplifyDebts } = req.body;
     const members = [...new Set([req.user._id.toString(), ...(memberIds || [])])];
-    const group = await Group.create({ name, createdBy: req.user._id, members });
+    const group = await Group.create({
+      name,
+      createdBy: req.user._id,
+      members,
+      type: type || 'other',
+      icon: icon || '',
+      image: image || '',
+      startDate: startDate || undefined,
+      endDate: endDate || undefined,
+      simplifyDebts: simplifyDebts !== undefined ? simplifyDebts : true,
+    });
     await group.populate('members', 'name email profilePic');
 
     await Activity.create({
@@ -358,13 +388,14 @@ router.post('/', async (req, res) => {
   }
 });
 
-// PATCH /api/groups/:id — update group fields (name, type, image, dates, simplifyDebts)
+// PATCH /api/groups/:id
 router.patch('/:id', async (req, res) => {
   try {
-    const { name, type, image, startDate, endDate, simplifyDebts } = req.body;
+    const { name, type, icon, image, startDate, endDate, simplifyDebts } = req.body;
     const patch = {};
     if (name !== undefined) patch.name = name.trim();
     if (type !== undefined) patch.type = type;
+    if (icon !== undefined) patch.icon = icon;
     if (image !== undefined) patch.image = image;
     if (startDate !== undefined) patch.startDate = startDate || null;
     if (endDate !== undefined) patch.endDate = endDate || null;
@@ -388,7 +419,7 @@ router.patch('/:id', async (req, res) => {
   }
 });
 
-// POST /api/groups/:id/members — add a member by userId
+// POST /api/groups/:id/members
 router.post('/:id/members', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -414,7 +445,7 @@ router.post('/:id/members', async (req, res) => {
   }
 });
 
-// DELETE /api/groups/:id/members/:userId — remove a member (only creator)
+// DELETE /api/groups/:id/members/:userId
 router.delete('/:id/members/:userId', async (req, res) => {
   try {
     const group = await Group.findOne({ _id: req.params.id, createdBy: req.user._id });
@@ -424,6 +455,11 @@ router.delete('/:id/members/:userId', async (req, res) => {
     }
     group.members = group.members.filter(m => m.toString() !== req.params.userId);
     await group.save();
+
+    // Recalculate balances so removed member's net is redistributed among remaining members.
+    // This ensures simplified debts and per-member totals reflect the current membership.
+    await recalculateGroupBalances(req.params.id);
+
     await group.populate('members', 'name email profilePic');
     res.json({ group });
   } catch (err) {
@@ -433,12 +469,29 @@ router.delete('/:id/members/:userId', async (req, res) => {
 
 // DELETE /api/groups/:id
 router.delete('/:id', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
-    const group = await Group.findOneAndDelete({ _id: req.params.id, createdBy: req.user._id });
-    if (!group) return res.status(404).json({ error: 'Group not found or not owner' });
+    const group = await Group.findOneAndDelete(
+      { _id: req.params.id, createdBy: req.user._id }
+    ).session(session);
+    if (!group) {
+      await session.abortTransaction();
+      return res.status(404).json({ error: 'Group not found or not owner' });
+    }
+
+    // Cascade delete related data
+    await Expense.deleteMany({ groupId: req.params.id }).session(session);
+    await Balance.deleteMany({ groupId: req.params.id }).session(session);
+    await Activity.deleteMany({ groupId: req.params.id }).session(session);
+
+    await session.commitTransaction();
     res.json({ message: 'Deleted' });
   } catch (err) {
+    await session.abortTransaction();
     res.status(500).json({ error: err.message });
+  } finally {
+    session.endSession();
   }
 });
 

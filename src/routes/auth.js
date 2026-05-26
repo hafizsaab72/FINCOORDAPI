@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const path = require('path');
 const multer = require('multer');
 const User = require('../models/User');
@@ -125,17 +126,44 @@ router.delete('/account', requireAuth, async (req, res) => {
   try {
     const userId = req.user._id;
     const Expense  = require('../models/Expense');
-    const Bill     = require('../models/Bill');
     const Group    = require('../models/Group');
     const Activity = require('../models/Activity');
+    const Balance  = require('../models/Balance');
+    const { recalculateGroupBalances } = require('../utils/balances');
+
+    // Find all groups affected by this user's expenses BEFORE deleting
+    const userExpenses = await Expense.find({
+      $or: [
+        { createdBy: userId },
+        { userId },
+        { directParticipants: userId },
+      ],
+    }).select('groupId');
+
+    const affectedGroupIds = [...new Set(
+      userExpenses.map(e => e.groupId?.toString()).filter(Boolean)
+    )];
 
     await Promise.all([
-      Expense.deleteMany({ userId }),
-      Bill.deleteMany({ userId }),
+      // Expenses: delete where user is creator, legacy owner, or direct participant
+      Expense.deleteMany({
+        $or: [
+          { createdBy: userId },
+          { userId },
+          { directParticipants: userId },
+        ],
+      }),
       Group.deleteMany({ createdBy: userId }),
       Activity.deleteMany({ userId }),
+      // Clear materialized balance cache
+      Balance.deleteMany({ userId }),
       User.findByIdAndDelete(userId),
     ]);
+
+    // Recalculate balances for all affected groups so other members' records are correct
+    for (const groupId of affectedGroupIds) {
+      await recalculateGroupBalances(groupId).catch(() => {});
+    }
 
     res.json({ message: 'Account permanently deleted' });
   } catch (err) {
@@ -179,6 +207,64 @@ router.post('/phone', async (req, res) => {
     res.json({ token: signToken(user._id), user: user.toSafeObject() });
   } catch (err) {
     res.status(401).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/forgot-password
+// Generates a secure reset token and returns it (email sending can be wired in later)
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) return res.status(404).json({ error: 'No account found with that email' });
+
+    // Generate a 32-byte random hex token
+    const rawToken = crypto.randomBytes(32).toString('hex');
+
+    // Hash the token before storing (SHA-256)
+    const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    user.resetPasswordToken = hashedToken;
+    user.resetPasswordExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    await user.save();
+
+    // TODO: In production, send the rawToken via email using nodemailer/SendGrid
+    // For now, return it in the response so the mobile app can display it
+    res.json({ message: 'Password reset token generated', token: rawToken });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/reset-password
+// Validates the token and updates the password
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword)
+      return res.status(400).json({ error: 'Token and new password are required' });
+    if (newPassword.length < 6)
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpires: { $gt: new Date() },
+    });
+
+    if (!user) return res.status(400).json({ error: 'Invalid or expired token' });
+
+    user.password = newPassword;
+    user.resetPasswordToken = '';
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    res.json({ message: 'Password reset successful' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
