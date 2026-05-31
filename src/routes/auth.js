@@ -270,4 +270,84 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
+// POST /api/auth/send-otp
+// Returns 123456 as OTP (email/SMS service not yet available)
+router.post('/send-otp', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) return res.status(404).json({ error: 'No account found with that email' });
+
+    // OTP is always 123456 until an email/SMS service is integrated
+    const otp = '123456';
+
+    user.resetOtp = otp;
+    user.resetOtpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    await user.save();
+
+    res.json({ message: 'OTP sent', otp, email: user.email });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/verify-otp
+// Verifies the OTP
+router.post('/verify-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ error: 'Email and OTP are required' });
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) return res.status(404).json({ error: 'No account found with that email' });
+
+    // Check if OTP matches and not expired
+    if (user.resetOtp !== otp) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+    if (!user.resetOtpExpires || new Date() > user.resetOtpExpires) {
+      return res.status(400).json({ error: 'OTP has expired' });
+    }
+
+    res.json({ message: 'OTP verified', email: user.email });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/reset-password-with-otp
+// Resets password after OTP verification
+router.post('/reset-password-with-otp', async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    if (!email || !otp || !newPassword)
+      return res.status(400).json({ error: 'Email, OTP, and new password are required' });
+    if (newPassword.length < 6)
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) return res.status(404).json({ error: 'No account found with that email' });
+
+    // Verify OTP
+    if (user.resetOtp !== otp) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+    if (!user.resetOtpExpires || new Date() > user.resetOtpExpires) {
+      return res.status(400).json({ error: 'OTP has expired' });
+    }
+
+    // Reset password
+    user.password = newPassword;
+    user.resetOtp = '';
+    user.resetOtpExpires = undefined;
+    await user.save();
+
+    res.json({ message: 'Password reset successful' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

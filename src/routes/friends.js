@@ -3,9 +3,11 @@ const FriendRequest = require('../models/FriendRequest');
 const User = require('../models/User');
 const Group = require('../models/Group');
 const Balance = require('../models/Balance');
+const Expense = require('../models/Expense');
+const Activity = require('../models/Activity');
 const requireAuth = require('../middleware/auth');
 const { sendPush } = require('../utils/push');
-const { getNonGroupBalancesPerspective } = require('../utils/balances');
+const { getNonGroupBalancesPerspective, simplifyDebts } = require('../utils/balances');
 
 router.use(requireAuth);
 
@@ -288,6 +290,80 @@ router.delete('/:friendId', async (req, res) => {
       ],
     });
     res.json({ message: 'Removed' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/friends/:friendId/settle — record a direct friend-to-friend settlement
+router.post('/:friendId/settle', async (req, res) => {
+  try {
+    const friendId = req.params.friendId;
+    const myId = req.user._id.toString();
+    const { amount, note } = req.body;
+
+    // 1. Compute the simplified debt between me and this friend
+    const nonGroupMap = await getNonGroupBalancesPerspective(myId);
+    const netFromSimplified = nonGroupMap.get(friendId)?.net ?? 0;
+
+    // netFromSimplified > 0  → friend owes me (in minor units)
+    // netFromSimplified < 0  → I owe friend (in minor units)
+    if (Math.abs(netFromSimplified) < 1) {
+      return res.status(400).json({ error: 'No balance with this friend. Add an expense first.' });
+    }
+
+    const iOwe = netFromSimplified; // positive = I owe them
+    const maxSettlement = Math.min(
+      amount ? Math.round(parseFloat(amount) * 100) : Math.abs(iOwe),
+      Math.abs(iOwe),
+    );
+
+    if (maxSettlement <= 0) {
+      return res.status(400).json({ error: 'Nothing to settle.' });
+    }
+
+    // 2. Verify friend relationship
+    const friendUser = await User.findById(friendId).select('name');
+    const friendName = friendUser?.name || 'Unknown';
+
+    // 3. Create a settlement expense (groupId = null → direct expense)
+    const settlementExpense = await Expense.create({
+      title: note || 'Settlement',
+      description: note || `Settlement with ${friendName}`,
+      totalAmount: maxSettlement,
+      baseCurrency: req.user.currency || 'INR',
+      contextType: 'non_group',
+      groupId: null,
+      directParticipants: [myId, friendId],
+      isSettlement: true,
+      settlementFrom: myId,
+      settlementTo: friendId,
+      payments: [{ userId: myId, amount: maxSettlement }],
+      splits: [{ userId: friendId, owedAmount: maxSettlement, shareType: 'exact' }],
+      splitType: 'exact',
+      createdBy: req.user._id,
+      userId: req.user._id,
+      category: 'settlement',
+    });
+
+    // 4. Update balances
+    const { updateBalancesOnExpenseCreate } = require('../utils/balances');
+    await updateBalancesOnExpenseCreate(settlementExpense, null);
+
+    // 5. Log activity
+    await Activity.create({
+      userId: req.user._id,
+      action: 'Settled Up',
+      detail: `${req.user.name} settled ${(maxSettlement / 100).toFixed(2)} with ${friendName}`,
+      expenseId: settlementExpense._id,
+      metadata: { withFriendId: friendId, amount: maxSettlement },
+    });
+
+    res.json({
+      settled: maxSettlement,
+      settlementExpenseId: settlementExpense._id,
+      message: `Successfully settled ${(maxSettlement / 100).toFixed(2)}`,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

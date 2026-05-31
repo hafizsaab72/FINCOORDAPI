@@ -72,10 +72,13 @@ router.get('/', async (req, res) => {
 
       const obj = group.toObject();
       obj.myBalance = {
-        net: totalOwedToYou - totalYouOwe,
-        totalOwedToYou,
-        totalYouOwe,
-        topDebts: topDebts.slice(0, 3),
+        net: parseFloat(((totalOwedToYou - totalYouOwe) / 100).toFixed(2)),
+        totalOwedToYou: parseFloat((totalOwedToYou / 100).toFixed(2)),
+        totalYouOwe: parseFloat((totalYouOwe / 100).toFixed(2)),
+        topDebts: topDebts.slice(0, 3).map(d => ({
+          ...d,
+          net: parseFloat((d.net / 100).toFixed(2)),
+        })),
       };
       return obj;
     });

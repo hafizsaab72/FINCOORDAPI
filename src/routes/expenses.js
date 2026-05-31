@@ -67,6 +67,48 @@ router.get('/', async (req, res) => {
   }
 });
 
+// GET /api/expenses/:id
+router.get('/:id', async (req, res) => {
+  try {
+    const myId = req.user._id.toString();
+
+    // Validate ObjectId format
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid expense ID format' });
+    }
+
+    const expense = await Expense.findById(req.params.id);
+
+    if (!expense) {
+      return res.status(404).json({ error: 'Expense not found' });
+    }
+
+    // Check access: user must be creator, payer, splitter, or direct participant
+    const isCreator = expense.createdBy && expense.createdBy.toString() === myId;
+    const isPayer = expense.payments && expense.payments.some(function(p) { return p.userId && p.userId.toString() === myId; });
+    const isSplitter = expense.splits && expense.splits.some(function(s) { return s.userId && s.userId.toString() === myId; });
+    const isDirectParticipant = expense.directParticipants && expense.directParticipants.some(function(p) { return p.toString() === myId; });
+
+    // For group expenses, members can also view
+    let isGroupMember = false;
+    if (expense.groupId) {
+      const group = await Group.findById(expense.groupId).select('members');
+      if (group) {
+        isGroupMember = group.members.some(function(m) { return m.toString() === myId; });
+      }
+    }
+
+    if (!isCreator && !isPayer && !isSplitter && !isDirectParticipant && !isGroupMember) {
+      return res.status(403).json({ error: 'Not authorized to view this expense' });
+    }
+
+    res.json({ expense });
+  } catch (err) {
+    console.error('GET /expenses/:id error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
 // POST /api/expenses
 router.post('/', async (req, res) => {
   const session = await mongoose.startSession();
@@ -89,6 +131,7 @@ router.post('/', async (req, res) => {
       recurrenceRule,
       contextType,
       directParticipants,
+      participants,
     } = req.body;
 
     // --- Build expense data ---
@@ -121,6 +164,21 @@ router.post('/', async (req, res) => {
       createdBy: req.user._id,
       userId: req.user._id,
     };
+
+    // --- Store participant display names for non-group (direct) expenses ---
+    // Non-group expenses may involve friends whose IDs aren't in our User collection,
+    // so we persist the names the user entered alongside the expense.
+    if (contextType === 'non_group' && participants && participants.length > 0) {
+      const nameMap = new Map();
+      participants.forEach(p => {
+        if (p.userId && p.name && p.name.trim().length > 0) {
+          nameMap.set(p.userId.toString(), p.name.trim());
+        }
+      });
+      if (nameMap.size > 0) {
+        expenseData.participantNames = nameMap;
+      }
+    }
 
     // --- VALIDATE ---
     const validation = validateExpenseSplit(expenseData);
@@ -173,7 +231,7 @@ router.patch('/:id', async (req, res) => {
   session.startTransaction();
 
   try {
-    const { totalAmount, notes, description, title, currency, splitType, payments, splits, date, category } = req.body;
+    const { totalAmount, notes, description, title, currency, splitType, payments, splits, date, category, participants } = req.body;
 
     // Fetch old expense
     const oldExpense = await Expense.findOne({
@@ -212,6 +270,18 @@ router.patch('/:id', async (req, res) => {
         shareValue: s.shareValue || 1,
         isExcluded: s.isExcluded || false,
       }));
+    }
+    if (participants && Array.isArray(participants)) {
+      // Rebuild participantNames map when participants are updated (e.g. after edit).
+      const nameMap = new Map();
+      participants.forEach(p => {
+        if (p.userId && p.name && p.name.trim().length > 0) {
+          nameMap.set(p.userId.toString(), p.name.trim());
+        }
+      });
+      if (nameMap.size > 0) {
+        patch.participantNames = nameMap;
+      }
     }
 
     // Apply patch

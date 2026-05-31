@@ -70,6 +70,11 @@ const ExpenseSchema = new mongoose.Schema({
   groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', index: true },
   directParticipants: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
 
+  // Participant display names — stored as Map for direct (non-group) expenses
+  // where user IDs may not resolve to readable names from the User collection alone.
+  // Key: userId string, Value: display name string.
+  participantNames: { type: Map, of: String, default: () => new Map() },
+
   // Core split data (embedded — always read together with expense)
   payments: [PaymentSchema],         // who paid how much
   splits: [SplitEntrySchema],        // who owes how much

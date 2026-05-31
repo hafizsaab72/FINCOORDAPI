@@ -16,6 +16,8 @@ const UserSchema = new mongoose.Schema(
     isPro:                { type: Boolean, default: false },
     resetPasswordToken:   { type: String, default: '' },
     resetPasswordExpires: { type: Date },
+    resetOtp:            { type: String, default: '' },
+    resetOtpExpires:     { type: Date },
   },
   { timestamps: true },
 );
